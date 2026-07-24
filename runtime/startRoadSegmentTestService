@@ -1,0 +1,290 @@
+#!/bin/bash
+
+SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
+PROGRAM_FLODER="$SCRIPT_DIR/"
+PROGRAM_NAME="RoadSegmentTestService"
+SELFNAME=$0
+SCRIPT_LOG_FILE="bash.start.log"
+CONF_FILE="${PROGRAM_FLODER}${PROGRAM_NAME}.conf"
+
+cd "$PROGRAM_FLODER" || exit 1
+
+BOOTUP=color
+RES_COL=60
+MOVE_TO_COL="echo -en \\033[${RES_COL}G"
+SETCOLOR_SUCCESS="echo -en \\033[1;32m"
+SETCOLOR_FAILURE="echo -en \\033[1;31m"
+SETCOLOR_WARNING="echo -en \\033[1;33m"
+SETCOLOR_NORMAL="echo -en \\033[0;39m"
+
+[ -f "$CONF_FILE" ] && . "$CONF_FILE"
+EVENT_TEST_PORT=${EVENT_TEST_PORT:-19000}
+EVENT_TEST_THREADS=${EVENT_TEST_THREADS:-4}
+ROAD_SEGMENT_URL=${ROAD_SEGMENT_URL:-http://127.0.0.1:8990/api/extract_road}
+SCENE_ROOT=${SCENE_ROOT:-/home/cpk/scene}
+MATCH_THRESHOLD=${MATCH_THRESHOLD:-0.30}
+export EVENT_TEST_PORT EVENT_TEST_THREADS ROAD_SEGMENT_URL SCENE_ROOT MATCH_THRESHOLD
+export LD_LIBRARY_PATH="${PROGRAM_FLODER}lib:${LD_LIBRARY_PATH:-}"
+
+checkpid() {
+    while [ "$1" ]; do
+        [ -d /proc/$1 ] && return 0
+        shift
+    done
+    return 1
+}
+
+echo_success() {
+    [ "$BOOTUP" = "color" ] && $MOVE_TO_COL
+    echo -n "  [  "
+    [ "$BOOTUP" = "color" ] && $SETCOLOR_SUCCESS
+    echo -n "OK"
+    [ "$BOOTUP" = "color" ] && $SETCOLOR_NORMAL
+    echo -n "  ]"
+    echo -ne "\r\n"
+    return 0
+}
+
+echo_failure() {
+    [ "$BOOTUP" = "color" ] && $MOVE_TO_COL
+    echo -n "  ["
+    [ "$BOOTUP" = "color" ] && $SETCOLOR_FAILURE
+    echo -n "FAILED"
+    [ "$BOOTUP" = "color" ] && $SETCOLOR_NORMAL
+    echo -n "]"
+    echo -ne "\r\n"
+    return 1
+}
+
+trimLogFile() {
+    logFile=$1
+    maxLines=10000
+    [ -f "$logFile" ] || return 0
+    if [ $(wc -l < "$logFile") -gt $maxLines ]; then
+        tail -n $maxLines "$logFile" > "$logFile.tmp"
+        mv "$logFile.tmp" "$logFile"
+    fi
+}
+
+logOutput() {
+    if [ -n "$SCRIPT_LOG_FILE" ]; then
+        logFile=$PROGRAM_FLODER/$SCRIPT_LOG_FILE
+        timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+        echo "[$timestamp] $@" >> "$logFile"
+        trimLogFile "$logFile"
+    fi
+}
+
+SUP_PID_FILE="${PROGRAM_FLODER}${PROGRAM_NAME}.supervisor.pid"
+APP_PID_FILE="${PROGRAM_FLODER}${PROGRAM_NAME}.pid"
+APP_STOPPED_FLAG="${PROGRAM_FLODER}${PROGRAM_NAME}.stopped_by_supervisor"
+
+is_running_pid() {
+    [ -n "$1" ] && [ -d "/proc/$1" ]
+}
+
+find_app_pid() {
+    if [ -f "$APP_PID_FILE" ]; then
+        pid=$(cat "$APP_PID_FILE" 2>/dev/null)
+        if [ -n "$pid" ] && is_running_pid "$pid"; then
+            echo "$pid"
+            return 0
+        fi
+    fi
+    pid=$(pidof "$PROGRAM_NAME" 2>/dev/null | awk '{print $1}')
+    if [ -n "$pid" ]; then
+        echo "$pid"
+        return 0
+    fi
+    echo ""
+    return 1
+}
+
+list_supervisors() {
+    ps -ef | grep "$SELFNAME __supervise" | grep -v grep | awk '{print $2}'
+}
+
+stop_all_supervisors() {
+    for spid in $(list_supervisors); do
+        if [ -n "$spid" ] && [ "$spid" != "$$" ] && is_running_pid "$spid"; then
+            logOutput "stopping extra supervisor (pid=$spid)."
+            kill -TERM "$spid" >/dev/null 2>&1
+            for i in 1 2 3 4 5; do
+                is_running_pid "$spid" || break
+                sleep 1
+            done
+            is_running_pid "$spid" && kill -KILL "$spid" >/dev/null 2>&1
+        fi
+    done
+}
+
+stop_legacy_starters() {
+    base=$(basename "$SELFNAME")
+    for lpid in $(ps -ef | grep -v grep | grep -E "[/ ]${base}( |$)" | grep -v "__supervise" | awk '{print $2}'); do
+        if [ -n "$lpid" ] && [ "$lpid" != "$$" ] && [ "$lpid" != "$PPID" ] && is_running_pid "$lpid"; then
+            logOutput "stopping legacy starter (pid=$lpid)."
+            kill -TERM "$lpid" >/dev/null 2>&1
+            for i in 1 2 3 4 5; do
+                is_running_pid "$lpid" || break
+                sleep 1
+            done
+            is_running_pid "$lpid" && kill -KILL "$lpid" >/dev/null 2>&1
+        fi
+    done
+}
+
+start_supervisor() {
+    trap '
+        APID=""
+        if [ -f "'"$APP_PID_FILE"'" ]; then
+            APID=$(cat "'"$APP_PID_FILE"'" 2>/dev/null)
+        fi
+        if [ -z "$APID" ]; then
+            APID=$(pidof "'"$PROGRAM_NAME"'" 2>/dev/null | awk "{print \$1}")
+        fi
+        if [ -n "$APID" ] && [ -d "/proc/$APID" ]; then
+            echo "$APID" > "'"$APP_STOPPED_FLAG"'"
+            kill -TERM "$APID" >/dev/null 2>&1
+        fi
+        rm -f "'"$APP_PID_FILE"'"
+        exit 0
+    ' INT TERM
+
+    while true; do
+        if [ -x "$PROGRAM_FLODER$PROGRAM_NAME" ]; then
+            cd "$PROGRAM_FLODER" || {
+                logOutput "cannot cd to $PROGRAM_FLODER, retry in 5s."
+                sleep 5
+                continue
+            }
+            start_ts=$(date +%s)
+            logOutput "program $PROGRAM_NAME start. port=$EVENT_TEST_PORT backend=$ROAD_SEGMENT_URL scene_root=$SCENE_ROOT threshold=$MATCH_THRESHOLD"
+            mkdir -p logs
+            ./$PROGRAM_NAME >> logs/${PROGRAM_NAME}.log 2>&1 &
+            APP_PID=$!
+            echo "$APP_PID" > "$APP_PID_FILE"
+            wait "$APP_PID"
+            EXIT_CODE=$?
+            rm -f "$APP_PID_FILE"
+            end_ts=$(date +%s)
+            run_dur=$((end_ts - start_ts))
+            logOutput "program $PROGRAM_NAME exit (pid=$APP_PID, code=$EXIT_CODE, run=${run_dur}s)."
+            if [ "$run_dur" -lt 3 ]; then
+                sleep 5
+            else
+                sleep 2
+            fi
+        else
+            logOutput "$PROGRAM_FLODER$PROGRAM_NAME not found or not executable."
+            sleep 5
+        fi
+    done
+}
+
+stop_program_only() {
+    echo -n "Stopping $PROGRAM_NAME..."
+    APP_PID_BEFORE=$(find_app_pid)
+    if [ -n "$APP_PID_BEFORE" ] && is_running_pid "$APP_PID_BEFORE"; then
+        kill -TERM "$APP_PID_BEFORE" >/dev/null 2>&1
+        for i in 1 2 3 4 5; do
+            is_running_pid "$APP_PID_BEFORE" || break
+            sleep 1
+        done
+        if is_running_pid "$APP_PID_BEFORE"; then
+            logOutput "$PROGRAM_NAME still alive after TERM, sending KILL (pid=$APP_PID_BEFORE)."
+            kill -KILL "$APP_PID_BEFORE" >/dev/null 2>&1
+            sleep 1
+        fi
+    fi
+    rm -f "$APP_PID_FILE" "$APP_STOPPED_FLAG"
+    checkpid "$APP_PID_BEFORE" >/dev/null 2>&1 && echo_failure || echo_success
+    logOutput "program $PROGRAM_NAME killed."
+    return 0
+}
+
+stop_sh() {
+    echo -n "Stopping Watchdog ..."
+    stop_all_supervisors
+    stop_legacy_starters
+    if [ -f "$SUP_PID_FILE" ]; then
+        SUP_PID=$(cat "$SUP_PID_FILE" 2>/dev/null)
+        if is_running_pid "$SUP_PID"; then
+            kill -TERM "$SUP_PID" >/dev/null 2>&1
+            for i in 1 2 3 4 5; do
+                is_running_pid "$SUP_PID" || break
+                sleep 1
+            done
+            is_running_pid "$SUP_PID" && kill -KILL "$SUP_PID" >/dev/null 2>&1
+        fi
+        rm -f "$SUP_PID_FILE"
+    fi
+    logOutput "stop server watchdog."
+    sleep 1
+    echo_success
+    stop_program_only
+}
+
+start() {
+    echo -n "Starting $PROGRAM_NAME..."
+    if [ -n "$(list_supervisors)" ]; then
+        echo_success
+        return 0
+    fi
+    nohup "$SELFNAME" __supervise >/dev/null 2>&1 &
+    SUP_PID=$!
+    echo "$SUP_PID" > "$SUP_PID_FILE"
+    logOutput "start server watchdog."
+    echo_success
+    return 0
+}
+
+status_runtime() {
+    SUP_PID=""
+    [ -f "$SUP_PID_FILE" ] && SUP_PID=$(cat "$SUP_PID_FILE" 2>/dev/null)
+    APP_PID=$(find_app_pid)
+    if [ -n "$SUP_PID" ] && is_running_pid "$SUP_PID"; then
+        echo "watchdog running (pid=$SUP_PID)"
+    else
+        echo "watchdog stopped"
+    fi
+    if [ -n "$APP_PID" ] && is_running_pid "$APP_PID"; then
+        echo "$PROGRAM_NAME running (pid=$APP_PID)"
+    else
+        echo "$PROGRAM_NAME stopped"
+    fi
+    echo "port=$EVENT_TEST_PORT backend=$ROAD_SEGMENT_URL scene_root=$SCENE_ROOT threshold=$MATCH_THRESHOLD"
+}
+
+ACTION=${1:-restart}
+logOutput "---------------------------"
+logOutput "bash script run with action: $ACTION."
+case "$ACTION" in
+    status)
+        status_runtime
+        ;;
+    start)
+        stop_sh
+        wait
+        start
+        ;;
+    restart)
+        stop_sh
+        wait
+        start
+        ;;
+    stop)
+        stop_sh
+        ;;
+    __supervise)
+        start_supervisor
+        ;;
+    "")
+        stop_sh
+        wait
+        start
+        ;;
+    *)
+        echo "Usage $0 {(start)|restart|stop|status}"
+        sleep 1
+        ;;
+esac
