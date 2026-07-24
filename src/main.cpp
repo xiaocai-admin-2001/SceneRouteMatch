@@ -997,49 +997,17 @@ int handle_highway_road_match(const AppConfig& cfg, HttpRequest* req, HttpRespon
             return write_error(resp, 400, err);
         }
 
-        SegmentResult client_segment = segment_image(cfg, "client_" + camera_id + "_" + std::to_string(now_ms()), image_bytes);
         auto scene_files = list_scene_images(std::filesystem::path(cfg.scene_root) / camera_id);
         if (scene_files.empty()) {
             return write_error(resp, 404, "no scene images found for camera_id: " + camera_id);
         }
 
-        double best_score = 0.0;
-        std::filesystem::path best_path;
-        int compared_count = 0;
-        int failed_count = 0;
-        Json scores = Json::array();
-
-        for (const auto& scene_path : scene_files) {
-            try {
-                SegmentResult scene_segment = segment_scene_image_cached(cfg, scene_path);
-                double score = polygon_iou(client_segment, scene_segment);
-                compared_count++;
-                scores.push_back({
-                    {"image", scene_path.filename().string()},
-                    {"score", score},
-                    {"polygon_count", scene_segment.polygons.is_array() ? static_cast<int>(scene_segment.polygons.size()) : 0}
-                });
-                if (score > best_score) {
-                    best_score = score;
-                    best_path = scene_path;
-                }
-            } catch (const std::exception& e) {
-                failed_count++;
-                g_logger.warn("scene image skipped path=" + scene_path.string() + " err=" + e.what());
-            }
-        }
-
-        std::sort(scores.begin(), scores.end(), [](const Json& lhs, const Json& rhs) {
-            return lhs.value("score", 0.0) > rhs.value("score", 0.0);
-        });
-
-        std::string road_result = best_score >= threshold ? configured_match_label(cfg, best_path) : "0";
         FeatureResult feature = call_feature_service(cfg, camera_id, image_bytes);
-        bool agreed = road_result != "0" && road_result == feature.result;
-        std::string result = agreed ? road_result : "0";
-        std::string final_best_image = agreed ? feature.best_image : "";
-        double total_score = agreed ? (best_score + feature.best_score) / 2.0 : 0.0;
-        Json metadata = agreed
+        bool matched = !feature.best_image.empty() && feature.best_score >= threshold;
+        std::string result = matched ? feature.result : "0";
+        std::string final_best_image = matched ? feature.best_image : "";
+        double total_score = matched ? feature.best_score : 0.0;
+        Json metadata = matched
             ? load_image_metadata(cfg, camera_id, final_best_image)
             : Json({{"result", nullptr}, {"direction", nullptr}, {"distances", Json::array()}});
         auto request_end = std::chrono::steady_clock::now();
@@ -1059,13 +1027,11 @@ int handle_highway_road_match(const AppConfig& cfg, HttpRequest* req, HttpRespon
         g_logger.info(
             "match request done camera_id=" + camera_id +
             " result=" + result +
-            " road_result=" + road_result +
             " feature_result=" + feature.result +
-            " agreed=" + std::string(agreed ? "true" : "false") +
+            " matched=" + std::string(matched ? "true" : "false") +
             " best_image=" + final_best_image +
             " total_score=" + std::to_string(total_score) +
-            " compared=" + std::to_string(compared_count) +
-            " failed=" + std::to_string(failed_count) +
+            " compared=" + std::to_string(feature.compared_count) +
             " total_ms=" + std::to_string(total_ms));
         return write_json(resp, 200, payload);
     } catch (const std::exception& e) {
@@ -1092,11 +1058,6 @@ int main() {
     router.GET("/ping", [](HttpRequest*, HttpResponse* resp) {
         resp->body = "pong";
         return 200;
-    });
-    router.POST("/api/test/highway_road_segment", [&cfg](HttpRequest* req, HttpResponse* resp) {
-        int status = handle_highway_road_segment(cfg, req, resp);
-        g_response_archive.save("highway_road_segment", resp->body);
-        return status;
     });
     router.POST("/api/test/highway_road_match", [&cfg](HttpRequest* req, HttpResponse* resp) {
         int status = handle_highway_road_match(cfg, req, resp);
