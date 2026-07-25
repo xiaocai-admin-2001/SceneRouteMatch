@@ -151,6 +151,7 @@ struct SegmentResult {
 };
 
 struct FeatureResult {
+    Json id = nullptr;
     std::string result = "0";
     std::string best_image;
     double best_score = 0.0;
@@ -443,6 +444,9 @@ FeatureResult call_feature_service(
     }
     const Json& data = response["data"];
     FeatureResult result;
+    if (data.contains("id")) {
+        result.id = data["id"];
+    }
     result.result = data.value("result", "0");
     result.best_image = data.value("best_image", "");
     result.best_score = data.value("best_score", 0.0);
@@ -1024,6 +1028,7 @@ int handle_highway_road_match(const AppConfig& cfg, HttpRequest* req, HttpRespon
         payload["msg"] = nullptr;
         payload["data"] = {
             {"camera_id", camera_id},
+            {"id", matched ? feature.id : Json(nullptr)},
             {"result", result},
             {"best_image", final_best_image.empty() ? Json(nullptr) : Json(final_best_image)},
             {"total_score", total_score},

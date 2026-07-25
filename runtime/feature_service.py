@@ -188,6 +188,7 @@ def candidate_paths(camera_id):
         ):
             continue
         metadata[str(path)] = {
+            "id": str(item.get("id", "")),
             "result": result,
             "direction": item.get("direction"),
             "distances": item.get("distances") if isinstance(item.get("distances"), list) else [],
@@ -273,6 +274,7 @@ def match():
                 "result": best["label"],
                 "best_image": best["image"],
                 "best_score": best["score"],
+                "id": best_metadata.get("id"),
                 "direction": best_metadata.get("direction"),
                 "distances": best_metadata.get("distances", []),
                 "matcher": MATCHER_MODE,
