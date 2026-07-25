@@ -90,11 +90,13 @@ RotatingLogger g_logger;
 
 class ResponseArchive {
 public:
-    void init(const std::string& root) {
+    void init(const std::string& root, bool enabled) {
         root_ = root;
+        enabled_ = enabled;
     }
 
     void save(const std::string& endpoint, const std::string& body) {
+        if (!enabled_) return;
         try {
             auto now = std::chrono::system_clock::now();
             std::time_t t = std::chrono::system_clock::to_time_t(now);
@@ -123,6 +125,7 @@ public:
     }
 
 private:
+    bool enabled_ = false;
     std::string root_ = "logs/responses";
     std::atomic<unsigned long long> sequence_{0};
 };
@@ -136,6 +139,7 @@ struct AppConfig {
     std::string feature_service_url = "http://127.0.0.1:19001/match";
     std::string scene_root = "/opt/RoadSegmentTestService/scene";
     std::string response_log_dir = "/opt/RoadSegmentTestService/logs/responses";
+    bool response_archive_enabled = false;
     double match_threshold = 0.30;
 };
 
@@ -1052,8 +1056,9 @@ int main() {
     cfg.feature_service_url = getenv_or("FEATURE_SERVICE_URL", cfg.feature_service_url);
     cfg.scene_root = getenv_or("SCENE_ROOT", cfg.scene_root);
     cfg.response_log_dir = getenv_or("RESPONSE_LOG_DIR", cfg.response_log_dir);
+    cfg.response_archive_enabled = getenv_int("RESPONSE_ARCHIVE_ENABLED", 0) != 0;
     cfg.match_threshold = getenv_double("MATCH_THRESHOLD", cfg.match_threshold);
-    g_response_archive.init(cfg.response_log_dir);
+    g_response_archive.init(cfg.response_log_dir, cfg.response_archive_enabled);
     g_logger.info("Logger initialized successfully");
 
     HttpService router;
