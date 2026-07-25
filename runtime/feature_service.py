@@ -4,6 +4,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 import cv2
@@ -20,7 +22,10 @@ MODEL_PATH = os.getenv(
     "/opt/RoadSegmentTestService/models/vit_base_patch16_dinov3.lvd1689m/model.safetensors",
 )
 LOMA_ROOT = Path(os.getenv("LOMA_ROOT", "/opt/RoadSegmentTestService/LoMa"))
-SCENE_ROOT = Path(os.getenv("SCENE_ROOT", "/opt/RoadSegmentTestService/scene"))
+CALIBRATION_API_URL = os.getenv(
+    "CALIBRATION_API_URL",
+    "http://10.88.4.37:9091/api/oauth/v3/marker/calibration/highway_scene_images",
+)
 DEVICE = os.getenv("FEATURE_DEVICE", "cuda:0" if torch.cuda.is_available() else "cpu")
 PORT = int(os.getenv("FEATURE_SERVICE_PORT", "19001"))
 MATCHER_MODE = os.getenv("FEATURE_MATCHER", "hybrid").lower()
@@ -62,18 +67,9 @@ loma_cache = {}
 inference_lock = threading.Lock()
 
 
-def scene_metadata(camera_dir):
-    path = camera_dir / "distance_map.json"
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else {}
-    except Exception:
-        return {}
-
-
 def label_from_name(path, metadata=None):
     if metadata:
-        item = metadata.get(path.name)
+        item = metadata.get(str(path))
         if isinstance(item, dict):
             result = str(item.get("result", ""))
             if result in ("0", "1", "2"):
@@ -159,16 +155,45 @@ def geometry_metrics(kpts_a, kpts_b, desc_a, desc_b, h1, w1, h2, w2):
 
 
 def candidate_paths(camera_id):
-    camera_dir = SCENE_ROOT / camera_id
-    if not camera_dir.is_dir():
-        return [], {}
-    metadata = scene_metadata(camera_dir)
-    return sorted(
-        p for p in camera_dir.iterdir()
-        if p.is_file()
-        and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-        and label_from_name(p, metadata) in {"0", "1", "2"}
-    ), metadata
+    url = CALIBRATION_API_URL + "?" + urllib.parse.urlencode({"camera_id": camera_id})
+    last_error = None
+    payload = None
+    for attempt in range(5):
+        try:
+            req = urllib.request.Request(url, headers={"Connection": "close"})
+            with urllib.request.urlopen(req, timeout=20) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt < 4:
+                time.sleep(0.5 * (attempt + 1))
+    if payload is None:
+        raise RuntimeError(f"calibration api request failed after 5 attempts: {last_error}")
+    if payload.get("code") != 200 or not isinstance(payload.get("data"), dict):
+        raise RuntimeError(f"calibration api error: {payload}")
+
+    paths = []
+    metadata = {}
+    for item in payload["data"].get("images", []):
+        if not isinstance(item, dict):
+            continue
+        path = Path(str(item.get("imagePath", "")))
+        result = str(item.get("result", ""))
+        if (
+            not path.is_absolute()
+            or not path.is_file()
+            or path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+            or result not in {"0", "1", "2"}
+        ):
+            continue
+        metadata[str(path)] = {
+            "result": result,
+            "direction": item.get("direction"),
+            "distances": item.get("distances") if isinstance(item.get("distances"), list) else [],
+        }
+        paths.append(path)
+    return sorted(paths), metadata
 
 
 @app.get("/ping")
@@ -193,13 +218,12 @@ def match():
     uploaded = request.files.get("image")
     if uploaded is None:
         return jsonify({"status_code": 400, "data": None, "msg": "missing image"}), 400
-    candidates, metadata = candidate_paths(camera_id)
-    if not candidates:
-        return jsonify({"status_code": 404, "data": None, "msg": "no scene images"}), 404
-
     suffix = Path(uploaded.filename or "query.jpg").suffix or ".jpg"
     temp_path = None
     try:
+        candidates, metadata = candidate_paths(camera_id)
+        if not candidates:
+            return jsonify({"status_code": 404, "data": None, "msg": "no scene images"}), 404
         raw = uploaded.read()
         with Image.open(__import__("io").BytesIO(raw)) as image:
             image = image.convert("RGB")
@@ -240,6 +264,7 @@ def match():
             rows.sort(key=lambda item: item["score"], reverse=True)
 
         best = rows[0]
+        best_metadata = metadata.get(str(best["path"]), {})
         public_rows = [{k: v for k, v in row.items() if k != "path"} for row in rows]
         return jsonify({
             "status_code": 200,
@@ -248,6 +273,8 @@ def match():
                 "result": best["label"],
                 "best_image": best["image"],
                 "best_score": best["score"],
+                "direction": best_metadata.get("direction"),
+                "distances": best_metadata.get("distances", []),
                 "matcher": MATCHER_MODE,
                 "compared_count": len(rows),
                 "candidate_count": len(candidates),

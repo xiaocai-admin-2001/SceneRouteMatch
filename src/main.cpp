@@ -152,6 +152,8 @@ struct FeatureResult {
     double best_score = 0.0;
     double runtime_ms = 0.0;
     int compared_count = 0;
+    Json direction = nullptr;
+    Json distances = Json::array();
 };
 
 struct SceneCacheEntry {
@@ -442,6 +444,12 @@ FeatureResult call_feature_service(
     result.best_score = data.value("best_score", 0.0);
     result.runtime_ms = data.value("runtime_ms", 0.0);
     result.compared_count = data.value("compared_count", 0);
+    if (data.contains("direction")) {
+        result.direction = data["direction"];
+    }
+    if (data.contains("distances") && data["distances"].is_array()) {
+        result.distances = data["distances"];
+    }
     return result;
 }
 
@@ -997,19 +1005,13 @@ int handle_highway_road_match(const AppConfig& cfg, HttpRequest* req, HttpRespon
             return write_error(resp, 400, err);
         }
 
-        auto scene_files = list_scene_images(std::filesystem::path(cfg.scene_root) / camera_id);
-        if (scene_files.empty()) {
-            return write_error(resp, 404, "no scene images found for camera_id: " + camera_id);
-        }
-
         FeatureResult feature = call_feature_service(cfg, camera_id, image_bytes);
         bool matched = !feature.best_image.empty() && feature.best_score >= threshold;
         std::string result = matched ? feature.result : "0";
         std::string final_best_image = matched ? feature.best_image : "";
         double total_score = matched ? feature.best_score : 0.0;
-        Json metadata = matched
-            ? load_image_metadata(cfg, camera_id, final_best_image)
-            : Json({{"result", nullptr}, {"direction", nullptr}, {"distances", Json::array()}});
+        Json direction = matched ? feature.direction : Json(nullptr);
+        Json distances = matched ? feature.distances : Json::array();
         auto request_end = std::chrono::steady_clock::now();
         double total_ms = std::chrono::duration<double, std::milli>(request_end - request_start).count();
 
@@ -1021,8 +1023,8 @@ int handle_highway_road_match(const AppConfig& cfg, HttpRequest* req, HttpRespon
             {"result", result},
             {"best_image", final_best_image.empty() ? Json(nullptr) : Json(final_best_image)},
             {"total_score", total_score},
-            {"direction", metadata["direction"]},
-            {"distances", metadata["distances"]}
+            {"direction", direction},
+            {"distances", distances}
         };
         g_logger.info(
             "match request done camera_id=" + camera_id +
@@ -1064,22 +1066,6 @@ int main() {
         g_response_archive.save("highway_road_match", resp->body);
         return status;
     });
-    router.POST("/api/test/highway_scene_image", [&cfg](HttpRequest* req, HttpResponse* resp) {
-        int status = handle_highway_scene_image(cfg, req, resp);
-        g_response_archive.save("highway_scene_image", resp->body);
-        return status;
-    });
-    router.Handle("DELETE", "/api/test/highway_scene_image", [&cfg](HttpRequest* req, HttpResponse* resp) {
-        int status = handle_delete_highway_scene_image(cfg, req, resp);
-        g_response_archive.save("delete_highway_scene_image", resp->body);
-        return status;
-    });
-    router.GET("/api/test/highway_scene_images", [&cfg](HttpRequest* req, HttpResponse* resp) {
-        int status = handle_highway_scene_images(cfg, req, resp);
-        g_response_archive.save("highway_scene_images", resp->body);
-        return status;
-    });
-
     hv::HttpServer server(&router);
     server.setPort(cfg.port);
     server.setThreadNum(cfg.threads);

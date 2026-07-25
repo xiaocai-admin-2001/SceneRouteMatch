@@ -1,0 +1,25 @@
+[Unit]
+Description=SceneRouteMatch Hybrid Feature Matching Service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/RoadSegmentTestService
+Environment=PYTHONPATH=/opt/RoadSegmentTestService/python_vendor
+Environment=FEATURE_MODEL_PATH=/opt/RoadSegmentTestService/models/vit_base_patch16_dinov3.lvd1689m/model.safetensors
+Environment=FEATURE_DEVICE=cuda:0
+Environment=FEATURE_SERVICE_PORT=19001
+Environment=CALIBRATION_API_URL=http://10.88.4.37:9091/api/oauth/v3/marker/calibration/highway_scene_images
+Environment=FEATURE_MATCHER=hybrid
+Environment=LOMA_ROOT=/opt/RoadSegmentTestService/LoMa
+Environment=LOMA_TOP_K=2
+Environment=LOMA_KEYPOINTS=2048
+Environment=LOMA_FILTER_THRESHOLD=0.1
+Environment=LOMA_RANSAC_THRESHOLD=1.5
+ExecStart=/home/zser/envs/roadseg/bin/python /opt/RoadSegmentTestService/feature_service.py
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target
