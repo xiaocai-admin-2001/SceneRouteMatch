@@ -33,6 +33,11 @@ LOMA_TOP_K = max(1, int(os.getenv("LOMA_TOP_K", "2")))
 LOMA_KEYPOINTS = max(256, int(os.getenv("LOMA_KEYPOINTS", "2048")))
 LOMA_FILTER_THRESHOLD = float(os.getenv("LOMA_FILTER_THRESHOLD", "0.1"))
 LOMA_RANSAC_THRESHOLD = float(os.getenv("LOMA_RANSAC_THRESHOLD", "1.5"))
+Y_MAPPING_HALF_HEIGHT = max(20, int(os.getenv("Y_MAPPING_HALF_HEIGHT", "100")))
+Y_MAPPING_MIN_MATCHES = max(2, int(os.getenv("Y_MAPPING_MIN_MATCHES", "4")))
+Y_MAPPING_MIN_POINTS = max(2, int(os.getenv("Y_MAPPING_MIN_POINTS", "2")))
+Y_MAPPING_SCORE_THRESHOLD = float(os.getenv("Y_MAPPING_SCORE_THRESHOLD", "0.15"))
+Y_MAPPING_MAX_MAD = float(os.getenv("Y_MAPPING_MAX_MAD", "80"))
 
 if MATCHER_MODE not in {"dino", "loma", "hybrid"}:
     raise ValueError(f"unsupported FEATURE_MATCHER: {MATCHER_MODE}")
@@ -154,6 +159,92 @@ def geometry_metrics(kpts_a, kpts_b, desc_a, desc_b, h1, w1, h2, w2):
     }
 
 
+def remap_distances(kpts_query, kpts_ref, desc_query, desc_ref,
+                    query_h, query_w, ref_h, ref_w, distances):
+    if not isinstance(distances, list) or not distances:
+        return []
+    with torch.inference_mode():
+        scores = loma_model(kpts_query, kpts_ref, desc_query, desc_ref)["scores"]
+    m0, _, match_scores, _ = filter_matches(scores, LOMA_FILTER_THRESHOLD)
+    valid = m0[0] > -1
+    if int(valid.sum().item()) < Y_MAPPING_MIN_MATCHES:
+        return []
+
+    ids_query = torch.where(valid)[0]
+    ids_ref = m0[0][valid]
+    pts_query = to_pixel_coords(
+        kpts_query[0][ids_query], query_h, query_w
+    ).cpu().numpy()
+    pts_ref = to_pixel_coords(
+        kpts_ref[0][ids_ref], ref_h, ref_w
+    ).cpu().numpy()
+    pair_scores = match_scores[0][valid].detach().float().cpu().numpy()
+
+    if len(pts_query) >= 8:
+        _, inlier_mask = cv2.findFundamentalMat(
+            pts_query, pts_ref,
+            method=cv2.USAC_MAGSAC,
+            ransacReprojThreshold=LOMA_RANSAC_THRESHOLD,
+            confidence=0.999,
+            maxIters=10000,
+        )
+        if inlier_mask is not None and int(inlier_mask.sum()) >= Y_MAPPING_MIN_MATCHES:
+            keep = inlier_mask.ravel().astype(bool)
+            pts_query = pts_query[keep]
+            pts_ref = pts_ref[keep]
+            pair_scores = pair_scores[keep]
+
+    scale_y = query_h / max(1.0, float(ref_h))
+    mapped = []
+    for item in distances:
+        if not isinstance(item, dict):
+            continue
+        try:
+            source_y = float(item["y"])
+            distance = float(item["distance"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        strip = np.abs(pts_ref[:, 1] - source_y) <= Y_MAPPING_HALF_HEIGHT
+        count = int(strip.sum())
+        if count < Y_MAPPING_MIN_MATCHES:
+            continue
+        offsets = pts_query[strip, 1] - pts_ref[strip, 1] * scale_y
+        offset = float(np.median(offsets))
+        deviations = np.abs(offsets - offset)
+        mad = float(np.median(deviations))
+        if mad > Y_MAPPING_MAX_MAD:
+            continue
+        mapped_y = source_y * scale_y + offset
+        if not np.isfinite(mapped_y) or mapped_y < 0 or mapped_y > query_h - 1:
+            continue
+        score_quality = float(np.clip(np.mean(pair_scores[strip]), 0.0, 1.0))
+        count_quality = min(count / 20.0, 1.0)
+        geometry_quality = max(0.0, 1.0 - mad / max(1.0, Y_MAPPING_MAX_MAD))
+        mapping_score = (
+            0.50 * score_quality + 0.30 * count_quality + 0.20 * geometry_quality
+        )
+        if mapping_score < Y_MAPPING_SCORE_THRESHOLD:
+            continue
+        mapped.append({
+            "source_y": source_y,
+            "y": float(mapped_y),
+            "distance": distance,
+            "mapping_score": float(mapping_score),
+            "match_count": count,
+        })
+
+    mapped.sort(key=lambda item: item["source_y"])
+    ordered = []
+    last_y = -1.0
+    for item in mapped:
+        if item["y"] > last_y + 1.0:
+            ordered.append(item)
+            last_y = item["y"]
+    if len(ordered) < Y_MAPPING_MIN_POINTS:
+        return []
+    return sorted(ordered, key=lambda item: item["y"])
+
+
 def candidate_paths(camera_id):
     url = CALIBRATION_API_URL + "?" + urllib.parse.urlencode({"camera_id": camera_id})
     last_error = None
@@ -266,6 +357,14 @@ def match():
 
         best = rows[0]
         best_metadata = metadata.get(str(best["path"]), {})
+        mapped_distances = []
+        if MATCHER_MODE in {"loma", "hybrid"}:
+            with inference_lock:
+                rk, rd, rh, rw = loma_features(best["path"])
+                mapped_distances = remap_distances(
+                    qk, rk, qd, rd, qh, qw, rh, rw,
+                    best_metadata.get("distances", []),
+                )
         public_rows = [{k: v for k, v in row.items() if k != "path"} for row in rows]
         return jsonify({
             "status_code": 200,
@@ -273,10 +372,12 @@ def match():
             "data": {
                 "result": best["label"],
                 "best_image": best["image"],
+                "best_image_path": str(best["path"]),
                 "best_score": best["score"],
                 "id": best_metadata.get("id"),
                 "direction": best_metadata.get("direction"),
                 "distances": best_metadata.get("distances", []),
+                "mapped_distances": mapped_distances,
                 "matcher": MATCHER_MODE,
                 "compared_count": len(rows),
                 "candidate_count": len(candidates),

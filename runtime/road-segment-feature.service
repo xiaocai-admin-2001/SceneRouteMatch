@@ -16,6 +16,11 @@ Environment=LOMA_TOP_K=2
 Environment=LOMA_KEYPOINTS=2048
 Environment=LOMA_FILTER_THRESHOLD=0.1
 Environment=LOMA_RANSAC_THRESHOLD=1.5
+Environment=Y_MAPPING_HALF_HEIGHT=100
+Environment=Y_MAPPING_MIN_MATCHES=4
+Environment=Y_MAPPING_MIN_POINTS=2
+Environment=Y_MAPPING_SCORE_THRESHOLD=0.15
+Environment=Y_MAPPING_MAX_MAD=80
 ExecStart=/home/zser/envs/roadseg/bin/python /opt/RoadSegmentTestService/feature_service.py
 Restart=on-failure
 RestartSec=3

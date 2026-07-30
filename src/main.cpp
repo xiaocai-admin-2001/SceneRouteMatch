@@ -141,6 +141,7 @@ struct AppConfig {
     std::string response_log_dir = "/opt/RoadSegmentTestService/logs/responses";
     bool response_archive_enabled = false;
     double match_threshold = 0.30;
+    double road_match_threshold = 0.55;
 };
 
 struct SegmentResult {
@@ -154,11 +155,13 @@ struct FeatureResult {
     Json id = nullptr;
     std::string result = "0";
     std::string best_image;
+    std::string best_image_path;
     double best_score = 0.0;
     double runtime_ms = 0.0;
     int compared_count = 0;
     Json direction = nullptr;
     Json distances = Json::array();
+    Json mapped_distances = Json::array();
 };
 
 struct SceneCacheEntry {
@@ -449,6 +452,7 @@ FeatureResult call_feature_service(
     }
     result.result = data.value("result", "0");
     result.best_image = data.value("best_image", "");
+    result.best_image_path = data.value("best_image_path", "");
     result.best_score = data.value("best_score", 0.0);
     result.runtime_ms = data.value("runtime_ms", 0.0);
     result.compared_count = data.value("compared_count", 0);
@@ -457,6 +461,9 @@ FeatureResult call_feature_service(
     }
     if (data.contains("distances") && data["distances"].is_array()) {
         result.distances = data["distances"];
+    }
+    if (data.contains("mapped_distances") && data["mapped_distances"].is_array()) {
+        result.mapped_distances = data["mapped_distances"];
     }
     return result;
 }
@@ -1003,9 +1010,13 @@ int handle_highway_road_match(const AppConfig& cfg, HttpRequest* req, HttpRespon
             return write_error(resp, 400, "invalid camera_id");
         }
 
-        double threshold = data.value("threshold", cfg.match_threshold);
-        threshold = std::max(0.0, std::min(1.0, threshold));
-        g_logger.info("match request start camera_id=" + camera_id + " threshold=" + std::to_string(threshold));
+        double threshold = std::max(0.0, std::min(1.0, cfg.match_threshold));
+        double road_threshold = std::max(
+            0.0, std::min(1.0, cfg.road_match_threshold));
+        g_logger.info(
+            "match request start camera_id=" + camera_id +
+            " threshold=" + std::to_string(threshold) +
+            " road_threshold=" + std::to_string(road_threshold));
 
         std::string image_bytes;
         std::string err;
@@ -1014,12 +1025,52 @@ int handle_highway_road_match(const AppConfig& cfg, HttpRequest* req, HttpRespon
         }
 
         FeatureResult feature = call_feature_service(cfg, camera_id, image_bytes);
-        bool matched = !feature.best_image.empty() && feature.best_score >= threshold;
+        bool feature_matched =
+            !feature.best_image.empty() &&
+            !feature.best_image_path.empty() &&
+            feature.best_score >= threshold;
+        double road_score = 0.0;
+        bool road_matched = false;
+        std::string road_error;
+        if (feature_matched) {
+            try {
+                std::string reference_bytes;
+                if (!read_file(feature.best_image_path, &reference_bytes, &err)) {
+                    throw std::runtime_error(err);
+                }
+                SegmentResult query_road = segment_image(
+                    cfg, "query_" + camera_id + "_" + std::to_string(now_ms()), image_bytes);
+                SegmentResult reference_road = segment_scene_image_cached(
+                    cfg, std::filesystem::path(feature.best_image_path));
+                road_score = polygon_iou(query_road, reference_road);
+                road_matched = road_score >= road_threshold;
+            } catch (const std::exception& e) {
+                road_error = e.what();
+                g_logger.warn(
+                    "road compare failed camera_id=" + camera_id +
+                    " image=" + feature.best_image +
+                    " err=" + road_error);
+            }
+        }
+
+        bool direct_match =
+            feature_matched && road_matched &&
+            feature.distances.is_array() && !feature.distances.empty();
+        bool recalibrated_match =
+            feature_matched && !road_matched &&
+            feature.mapped_distances.is_array() &&
+            feature.mapped_distances.size() >= 2;
+        bool matched = direct_match || recalibrated_match;
+        std::string match_mode = direct_match
+            ? "road_feature_direct"
+            : (recalibrated_match ? "feature_recalibrated" : "no_match");
         std::string result = matched ? feature.result : "0";
         std::string final_best_image = matched ? feature.best_image : "";
         double total_score = matched ? feature.best_score : 0.0;
         Json direction = matched ? feature.direction : Json(nullptr);
-        Json distances = matched ? feature.distances : Json::array();
+        Json distances = direct_match
+            ? feature.distances
+            : (recalibrated_match ? feature.mapped_distances : Json::array());
         auto request_end = std::chrono::steady_clock::now();
         double total_ms = std::chrono::duration<double, std::milli>(request_end - request_start).count();
 
@@ -1031,7 +1082,10 @@ int handle_highway_road_match(const AppConfig& cfg, HttpRequest* req, HttpRespon
             {"MatchId", matched ? feature.id : Json(nullptr)},
             {"result", result},
             {"best_image", final_best_image.empty() ? Json(nullptr) : Json(final_best_image)},
+            {"match_mode", match_mode},
             {"total_score", total_score},
+            {"feature_score", feature.best_score},
+            {"road_score", road_score},
             {"direction", direction},
             {"distances", distances}
         };
@@ -1039,9 +1093,12 @@ int handle_highway_road_match(const AppConfig& cfg, HttpRequest* req, HttpRespon
             "match request done camera_id=" + camera_id +
             " result=" + result +
             " feature_result=" + feature.result +
-            " matched=" + std::string(matched ? "true" : "false") +
+            " feature_matched=" + std::string(feature_matched ? "true" : "false") +
+            " road_matched=" + std::string(road_matched ? "true" : "false") +
+            " match_mode=" + match_mode +
             " best_image=" + final_best_image +
             " total_score=" + std::to_string(total_score) +
+            " road_score=" + std::to_string(road_score) +
             " compared=" + std::to_string(feature.compared_count) +
             " total_ms=" + std::to_string(total_ms));
         return write_json(resp, 200, payload);
@@ -1063,6 +1120,8 @@ int main() {
     cfg.response_log_dir = getenv_or("RESPONSE_LOG_DIR", cfg.response_log_dir);
     cfg.response_archive_enabled = getenv_int("RESPONSE_ARCHIVE_ENABLED", 0) != 0;
     cfg.match_threshold = getenv_double("MATCH_THRESHOLD", cfg.match_threshold);
+    cfg.road_match_threshold = getenv_double(
+        "ROAD_MATCH_THRESHOLD", cfg.road_match_threshold);
     g_response_archive.init(cfg.response_log_dir, cfg.response_archive_enabled);
     g_logger.info("Logger initialized successfully");
 

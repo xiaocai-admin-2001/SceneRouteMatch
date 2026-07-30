@@ -21,9 +21,15 @@ SETCOLOR_NORMAL="echo -en \\033[0;39m"
 EVENT_TEST_PORT=${EVENT_TEST_PORT:-19000}
 EVENT_TEST_THREADS=${EVENT_TEST_THREADS:-4}
 ROAD_SEGMENT_URL=${ROAD_SEGMENT_URL:-http://127.0.0.1:8990/api/extract_road}
+FEATURE_SERVICE_URL=${FEATURE_SERVICE_URL:-http://127.0.0.1:19001/match}
 SCENE_ROOT=${SCENE_ROOT:-/home/cpk/scene}
 MATCH_THRESHOLD=${MATCH_THRESHOLD:-0.30}
-export EVENT_TEST_PORT EVENT_TEST_THREADS ROAD_SEGMENT_URL SCENE_ROOT MATCH_THRESHOLD
+ROAD_MATCH_THRESHOLD=${ROAD_MATCH_THRESHOLD:-0.55}
+RESPONSE_LOG_DIR=${RESPONSE_LOG_DIR:-/opt/RoadSegmentTestService/logs/responses}
+RESPONSE_ARCHIVE_ENABLED=${RESPONSE_ARCHIVE_ENABLED:-0}
+export EVENT_TEST_PORT EVENT_TEST_THREADS ROAD_SEGMENT_URL FEATURE_SERVICE_URL
+export SCENE_ROOT MATCH_THRESHOLD ROAD_MATCH_THRESHOLD
+export RESPONSE_LOG_DIR RESPONSE_ARCHIVE_ENABLED
 export LD_LIBRARY_PATH="${PROGRAM_FLODER}lib:${LD_LIBRARY_PATH:-}"
 
 checkpid() {
@@ -158,7 +164,7 @@ start_supervisor() {
                 continue
             }
             start_ts=$(date +%s)
-            logOutput "program $PROGRAM_NAME start. port=$EVENT_TEST_PORT backend=$ROAD_SEGMENT_URL scene_root=$SCENE_ROOT threshold=$MATCH_THRESHOLD"
+            logOutput "program $PROGRAM_NAME start. port=$EVENT_TEST_PORT backend=$ROAD_SEGMENT_URL feature=$FEATURE_SERVICE_URL threshold=$MATCH_THRESHOLD road_threshold=$ROAD_MATCH_THRESHOLD"
             mkdir -p logs
             ./$PROGRAM_NAME >> logs/${PROGRAM_NAME}.log 2>&1 &
             APP_PID=$!
@@ -252,7 +258,7 @@ status_runtime() {
     else
         echo "$PROGRAM_NAME stopped"
     fi
-    echo "port=$EVENT_TEST_PORT backend=$ROAD_SEGMENT_URL scene_root=$SCENE_ROOT threshold=$MATCH_THRESHOLD"
+    echo "port=$EVENT_TEST_PORT backend=$ROAD_SEGMENT_URL feature=$FEATURE_SERVICE_URL threshold=$MATCH_THRESHOLD road_threshold=$ROAD_MATCH_THRESHOLD"
 }
 
 ACTION=${1:-restart}
